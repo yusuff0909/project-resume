@@ -1,0 +1,55 @@
+{
+    "taskDefinitionArn": "arn:aws:ecs:us-east-1:654654479127:task-definition/nginx-task:25",
+    "containerDefinitions": [
+        {
+            "name": "nginx",
+            "image": "nginx:latest",
+            "cpu": 256,
+            "memory": 512,
+            "portMappings": [
+                {
+                    "containerPort": 80,
+                    "hostPort": 80,
+                    "protocol": "tcp"
+                }
+            ],
+            "essential": true,
+            "environment": [],
+            "mountPoints": [],
+            "volumesFrom": [],
+            "systemControls": []
+        }
+    ],
+    "family": "nginx-task",
+    "executionRoleArn": "arn:aws:iam::654654479127:role/ecs-task-execution-role",
+    "networkMode": "awsvpc",
+    "revision": 25,
+    "volumes": [],
+    "status": "ACTIVE",
+    "requiresAttributes": [
+        {
+            "name": "com.amazonaws.ecs.capability.docker-remote-api.1.18"
+        },
+        {
+            "name": "ecs.capability.task-eni"
+        }
+    ],
+    "placementConstraints": [],
+    "compatibilities": [
+        "EC2",
+        "FARGATE"
+    ],
+    "requiresCompatibilities": [
+        "FARGATE"
+    ],
+    "cpu": "256",
+    "memory": "512",
+    "registeredAt": "2025-07-28T21:23:59.894Z",
+    "registeredBy": "arn:aws:iam::654654479127:user/Main-student",
+    "tags": [
+        {
+            "key": "Name",
+            "value": "nginx-task-definition"
+        }
+    ]
+}

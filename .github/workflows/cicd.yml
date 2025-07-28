@@ -1,0 +1,170 @@
+name: Build, Scan, and Deploy to ECS
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AWS_REGION: us-east-1                   # e.g., us-east-1
+  ECR_REPO_NAME: project-resume            # e.g., my-app-repo
+  ECS_CLUSTER: nginx-cluster           # e.g., production-cluster
+  ECS_SERVICE: nginx-service           # e.g., my-app-service
+  CONTAINER_NAME: nginx          # e.g., app-container
+  IMAGE_TAG: ${{ github.sha }}                 # Uses commit hash as image tag
+  TASK_DEF_FILE: "nginx-task-revision25.json"    # Path to your task definition file
+  AWS_ROLE: secrets.aws_role_arn          # Role to assume for AWS actions
+
+jobs:
+  Build:
+    runs-on: ubuntu-latest
+    outputs:
+      image-uri: ${{ steps.set-image.outputs.image-uri }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws_role_arn }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v1
+      
+      # Security scanning steps (filesystem)
+      - name: Filesystem Scan with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'json'
+          output: "trivy-fs-results.json"
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+      
+      # Build Docker image
+      - name: Build and tag Docker image
+        run: |
+          docker build -t ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPO_NAME}}:${{ env.IMAGE_TAG }} .
+      
+      # Security scanning steps (Docker image)
+      - name: Scan Docker Image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPO_NAME}}:${{ env.IMAGE_TAG }}"
+          format: "json"
+          exit-code: "0"
+          output: "trivy-image-results.json"
+          severity: "CRITICAL,HIGH"
+      
+      # Push to ECR
+      - name: Push image to Amazon ECR
+        run: |
+          docker push ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPO_NAME}}:${{ env.IMAGE_TAG }}
+      
+      # Store image URI for deployment
+      - name: Store image URI for Deploy job
+        id: set-image
+        run: |
+          IMAGE_URI="${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPO_NAME}}:${{ env.IMAGE_TAG }}"
+          echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+      
+      # Security report on PRs
+      - name: Post Security Report on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            try {
+              const fsReport = JSON.parse(fs.readFileSync('trivy-fs-results.json', 'utf8'));
+              const imageReport = JSON.parse(fs.readFileSync('trivy-image-results.json', 'utf8'));
+              
+              const formatVulns = (vulns) => vulns.map(v => `
+                **Package:** ${v.PkgName} (${v.InstalledVersion})  
+                **Vulnerability:** ${v.VulnerabilityID} (${v.Severity})  
+                **Fix Version:** ${v.FixedVersion || 'None'}  
+                **Details:** ${v.Description || 'N/A'}
+              `).join('\n\n');
+
+              const fsVulns = fsReport.Results?.flatMap(r => r.Vulnerabilities || []) || [];
+              const imageVulns = imageReport.Results?.flatMap(r => r.Vulnerabilities || []) || [];
+
+              let comment = '## 🔒 Security Scan Results\n';
+              if (fsVulns.length > 0) comment += `### 📂 Filesystem Vulnerabilities\n${formatVulns(fsVulns)}\n\n`;
+              if (imageVulns.length > 0) comment += `### 🐳 Container Image Vulnerabilities\n${formatVulns(imageVulns)}\n\n`;
+              if (fsVulns.length + imageVulns.length === 0) comment += '✅ No critical/high vulnerabilities detected.\n';
+
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            } catch (error) {
+              core.error('Error processing security results: ' + error.message);
+            }
+
+  Deploy:
+    needs: Build
+    if: github.event_name == 'push'  # Only deploy on push to main
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws_role_arn }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      # Update the task definition file with new image
+      - name: Update task definition with new image
+        run: |
+          # Install jq for JSON processing
+          sudo apt-get install -y jq
+          
+          # Update the image in the task definition file
+          jq \
+            --arg IMAGE "${{ needs.Build.outputs.image-uri }}" \
+            --arg CONTAINER "${{ env.CONTAINER_NAME }}" \
+            '.containerDefinitions[] = (.containerDefinitions[] | select(.name == $CONTAINER).image = $IMAGE)' \
+            ${{ env.TASK_DEF_FILE }} > temp.json && mv temp.json ${{ env.TASK_DEF_FILE }}
+          
+          echo "Updated task definition:"
+          cat ${{ env.TASK_DEF_FILE }}
+      
+      # Register new task definition revision
+      - name: Register new task definition
+        id: register-task-def
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://${{ env.TASK_DEF_FILE }} \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+          echo "task-definition-arn=${TASK_DEF_ARN}" >> $GITHUB_OUTPUT
+          echo "Registered new task definition: ${TASK_DEF_ARN}"
+      
+      # Deploy to ECS service
+      - name: Deploy to ECS service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition ${{ steps.register-task-def.outputs.task-definition-arn }} \
+            --force-new-deployment
+      
+      # Wait for service stability
+      - name: Wait for deployment to complete
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }}
