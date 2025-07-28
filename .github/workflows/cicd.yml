@@ -136,11 +136,12 @@ jobs:
           # Install jq for JSON processing
           sudo apt-get install -y jq
           
-          # Update the image in the task definition file
+          # Clean up the task definition by removing AWS metadata fields and update image
           jq \
             --arg IMAGE "${{ needs.Build.outputs.image-uri }}" \
             --arg CONTAINER "${{ env.CONTAINER_NAME }}" \
-            '.containerDefinitions[] = (.containerDefinitions[] | select(.name == $CONTAINER).image = $IMAGE)' \
+            'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy) |
+             (.containerDefinitions[] | select(.name == $CONTAINER)).image = $IMAGE' \
             ${{ env.TASK_DEF_FILE }} > temp.json && mv temp.json ${{ env.TASK_DEF_FILE }}
           
           echo "Updated task definition:"
